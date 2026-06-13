@@ -2,6 +2,9 @@
 Virtual Geometry for Unity - 1 shot from Fable 5.
 Pull requests are accepted, i'm out of tokens (and Fable 5 is blocked for non-US users..)
 
+### Setup
+- https://github.com/unitycoder/VibeniteForUnity/blob/main/Assets/Vibenite/VIBENITE-README.md
+
 ### Results
 Results for 41m vertices (80 highpoly teapots)
 - Original: 56 fps (cpu 18ms)
