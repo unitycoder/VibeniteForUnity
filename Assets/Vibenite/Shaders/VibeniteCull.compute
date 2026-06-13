@@ -1,0 +1,98 @@
+// Vibenite GPU culling + LOD selection.
+// One thread per (instance, cluster) pair across ALL LOD levels.
+// A cluster survives iff:
+//   projected(selfError)   <= threshold   (it is detailed enough)
+//   projected(parentError) >  threshold   (its parent is NOT detailed enough)
+// Because errors are monotonic up the hierarchy and parent/child evaluate the
+// SAME group error with the SAME group bounds, this picks an exact, crack-free
+// cut without any CPU traversal.
+
+#pragma kernel ClearArgs
+#pragma kernel Cull
+
+struct GpuCluster
+{
+    float3 center;       float radius;        // tight culling bounds
+    float3 lodCenter;    float lodRadius;     // bounds of the group this cluster came from
+    float3 parentCenter; float parentRadius;  // bounds of the parent group
+    float  error;        float parentError;   // object-space errors (parentError = ~FLT_MAX at roots)
+    uint   indexOffset;  uint  triangleCount;
+};
+
+struct GpuInstance
+{
+    float4x4 localToWorld;
+    float    maxScale;
+    float3   _pad;
+};
+
+StructuredBuffer<GpuCluster>   _Clusters;
+StructuredBuffer<GpuInstance>  _Instances;
+StructuredBuffer<uint2>        _ClusterInstances; // x = instance index, y = cluster index
+RWStructuredBuffer<uint2>      _Visible;
+RWStructuredBuffer<uint>       _Args;             // [0]=vertexCount(384) [1]=instanceCount [2..3]=0
+
+uint   _ClusterInstanceCount;
+float4 _FrustumPlanes[6];
+float3 _CameraPos;
+float  _ErrorScale;   // perspective: 0.5*pixelHeight/tan(fov/2);  ortho: pixels per world unit
+float  _Threshold;    // allowed error in pixels
+uint   _Orthographic;
+
+[numthreads(1,1,1)]
+void ClearArgs(uint3 id : SV_DispatchThreadID)
+{
+    _Args[0] = 128u * 3u; // MaxTrisPerCluster * 3
+    _Args[1] = 0u;
+    _Args[2] = 0u;
+    _Args[3] = 0u;
+}
+
+float ProjectError(float err, float3 sphereCenterWS, float sphereRadiusWS)
+{
+    if (_Orthographic == 1u)
+        return err * _ErrorScale;
+    float d = max(distance(_CameraPos, sphereCenterWS) - sphereRadiusWS, 0.01);
+    return err * _ErrorScale / d;
+}
+
+[numthreads(64,1,1)]
+void Cull(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _ClusterInstanceCount)
+        return;
+
+    uint2 ci = _ClusterInstances[id.x];
+    GpuInstance inst = _Instances[ci.x];
+    GpuCluster  c    = _Clusters[ci.y];
+    float s = inst.maxScale;
+
+    // ---- LOD cut test ----
+    float3 lodCenterWS = mul(inst.localToWorld, float4(c.lodCenter, 1)).xyz;
+    float selfE = ProjectError(c.error * s, lodCenterWS, c.lodRadius * s);
+
+    float parentE = 1e30;
+    if (c.parentError < 9e29)
+    {
+        float3 parentCenterWS = mul(inst.localToWorld, float4(c.parentCenter, 1)).xyz;
+        parentE = ProjectError(c.parentError * s, parentCenterWS, c.parentRadius * s);
+    }
+
+    if (!(selfE <= _Threshold && parentE > _Threshold))
+        return;
+
+    // ---- frustum cull ----
+    float3 centerWS = mul(inst.localToWorld, float4(c.center, 1)).xyz;
+    float  radiusWS = c.radius * s;
+
+    [unroll]
+    for (int i = 0; i < 6; i++)
+    {
+        if (dot(_FrustumPlanes[i].xyz, centerWS) + _FrustumPlanes[i].w < -radiusWS)
+            return;
+    }
+
+    uint slot;
+    InterlockedAdd(_Args[1], 1u, slot);
+    _Visible[slot] = ci;
+}
